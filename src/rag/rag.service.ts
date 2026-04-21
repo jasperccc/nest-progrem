@@ -2,12 +2,39 @@ import { Injectable } from '@nestjs/common';
 // 文件上传引入
 import * as fs from 'fs';
 const { PDFParse } = require('pdf-parse');
+const mammoth = require('mammoth');
 // 引入大模型
 import { ChatOpenAI, OpenAIEmbeddings } from '@langchain/openai';
 import { config } from '../config';
-import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { Chroma } from '@langchain/community/vectorstores/chroma';
 import { Document } from '@langchain/core/documents';
+//文本清洗
+import { cleanTextByFileType } from './utils/text-cleaner';
+//提示词
+import {
+  createRagPrompt,
+  parseRagJsonAnswer,
+  createRewriteQuestionPrompt,
+} from './utils/prompt-builder';
+//不同文件使用不同的切片
+import { createTextSplitter } from './utils/chunk-splitter';
+// 去重召回
+import { dedupeRetrievedDocs } from './utils/deduplication-recall';
+
+import {
+  appendSessionMessage,
+  createSessionId,
+  deleteSession,
+  getAllSessions,
+  getSessionHistory,
+  hasSession,
+} from './utils/session-store';
+
+type ChatHistoryItem = {
+  role: 'user' | 'assistant';
+  content: string;
+};
+
 @Injectable()
 export class RagService {
   // 引入大模型
@@ -32,28 +59,35 @@ export class RagService {
     collectionName: 'rag-knowledge-base',
   };
 
+  private retrievalConfig = {
+    recallTopK: 8,
+    finalTopK: 4,
+    scoreThreshold: 0.2,
+  };
+
   //记录文档数量
   private docCount = 0;
 
-  // ── 加载文档到 Chroma ──────────────────────────────────
+  //加载文档到 Chroma
   async loadDocuments(
     documents: { id: string; content: string; source?: string }[],
   ) {
-    //文档切分规则
-    const splitter = new RecursiveCharacterTextSplitter({
-      chunkSize: 500,
-      chunkOverlap: 50,
-      separators: ['\n\n', '\n', '。', '！', '？', ' ', ''],
-    });
-
     const allDocs: Document[] = [];
     for (const doc of documents) {
+      const splitter = createTextSplitter(doc.source || doc.id);
       //创建文档对象
       const chunks = await splitter.createDocuments(
         [doc.content],
         [{ source: doc.source || doc.id, docId: doc.id }],
       );
-      console.log('chunks', chunks);
+      console.log(
+        '切片结果',
+        chunks.map((chunk, index) => ({
+          chunk: index + 1,
+          length: chunk.pageContent.length,
+          preview: chunk.pageContent.slice(0, 80),
+        })),
+      );
 
       allDocs.push(...chunks);
     }
@@ -90,45 +124,82 @@ export class RagService {
   }
 
   // 检索上下文
-  private async retrieveContext(message: string, topK = 3) {
+  private async retrieveContext(
+    message: string,
+    topK = this.retrievalConfig.recallTopK,
+  ) {
     const vectorStore = await this.getVectorStore();
     //相似度检测
-    const docs = await vectorStore.similaritySearch(message, topK);
-    return docs;
+    return vectorStore.similaritySearchWithScore(message, topK);
   }
 
-  // 拼prompt
-  private createPrompt(message: string, docs: Document[]) {
-    const context = docs
-      .map((doc, index) => {
-        return `片段${index + 1}：\n${doc.pageContent}`;
-      })
-      .join('\n\n');
-    return `
-      你是一个基于知识库回答问题的助手。
-      请严格依据提供的上下文回答问题。
-      如果上下文里找不到答案，就明确回答“我无法从当前知识库中找到答案”，不要编造内容。
-      上下文：${context}
-      用户问题：${message}`.trim();
+  //添加过滤方法
+  private filterDocsByScore(results: [Document, number][], threshold: number) {
+    return results.filter(([_, score]) => score >= threshold);
+  }
+
+  //增加一个重新历史问题的方法
+  private async rewriteQuestion(
+    message: string,
+    history: ChatHistoryItem[] = [],
+  ) {
+    if (!history.length) {
+      return message;
+    }
+
+    const prompt = createRewriteQuestionPrompt(message, history);
+    const res = await this.llm.invoke(prompt);
+
+    const content =
+      typeof res.content === 'string'
+        ? res.content
+        : JSON.stringify(res.content);
+
+    return content.trim();
   }
 
   // 文档上传接口
   async upload(file: any) {
     try {
-      //1,读取文件 buffer
-      const fileBuffer = fs.readFileSync(file.path);
-      // 2. 解析 PDF 文本
-      const parser = new PDFParse({ data: fileBuffer });
-      const pdfResult = await parser.getText();
-      //   console.log('文本', pdfResult.text);
-      //用完解析器之后直接销毁，释放内存
-      await parser.destroy();
+      const isPdf = /\.pdf$/i.test(file.originalname);
+      const isMarkdown = /\.md$/i.test(file.originalname);
+      const isTxt = /\.txt$/i.test(file.originalname);
+      const isDocx = /\.docx$/i.test(file.originalname);
+      let parsedText = '';
+      let numpages: number | undefined;
+
+      if (isPdf) {
+        // 1. 读取 PDF buffer
+        const fileBuffer = fs.readFileSync(file.path);
+        // 2. 解析 PDF 文本
+        const parser = new PDFParse({ data: fileBuffer });
+        const pdfResult = await parser.getText();
+        parsedText = pdfResult.text;
+        numpages = pdfResult.numpages;
+        // 用完解析器后销毁，释放内存
+        await parser.destroy();
+      } else if (isMarkdown) {
+        // Markdown 直接按文本读取
+        parsedText = fs.readFileSync(file.path, 'utf-8');
+      } else if (isTxt) {
+        // TXT 直接按文本读取
+        parsedText = fs.readFileSync(file.path, 'utf-8');
+      } else if (isDocx) {
+        // DOCX 通过 mammoth 提取纯文本
+        const fileBuffer = fs.readFileSync(file.path);
+        const docxResult = await mammoth.extractRawText({ buffer: fileBuffer });
+        parsedText = docxResult.value;
+      } else {
+        throw new Error('暂不支持该文件类型');
+      }
+
+      const cleanedText = cleanTextByFileType(parsedText, file.originalname);
 
       // 添加文档入库逻辑
       const documents = [
         {
           id: file.name,
-          content: pdfResult.text,
+          content: cleanedText,
           source: file.originalname,
         },
       ];
@@ -139,37 +210,108 @@ export class RagService {
         success: true,
         filePath: file.path,
         fileName: file.originalname,
-        message: 'PDF 上传,解析并入库成功',
-        pdfText: pdfResult.text, // 解析后的文本
-        pages: pdfResult.numpages, // 页数
+        message: '文件上传、解析并入库成功',
+        fileText: cleanedText, // 解析后的文本
+        pages: numpages, // PDF 页数，Markdown 无此字段
       };
     } catch (e) {
       console.error('PDF上传/解析失败，错误详情:', e);
       return {
         success: false,
-        message: 'PDF 上传失败',
+        message: '文件上传失败',
         error: e,
       };
     }
   }
 
   //知识库问答
-  async query(message: string, topK: number) {
+  async query(message: string, sessionId?: string) {
     try {
-      const docs = await this.retrieveContext(message, topK);
-      if (!docs.length) {
+      //会话id
+      let currentSessionId = sessionId;
+
+      if (!currentSessionId || !hasSession(currentSessionId)) {
+        currentSessionId = createSessionId();
+      }
+
+      const history = getSessionHistory(currentSessionId);
+
+      const rewrittenQuestion = await this.rewriteQuestion(message, history);
+
+      const results = await this.retrieveContext(
+        rewrittenQuestion,
+        this.retrievalConfig.recallTopK,
+      );
+
+      const filteredResults = this.filterDocsByScore(
+        results,
+        this.retrievalConfig.scoreThreshold,
+      );
+
+      const dedupedResults = dedupeRetrievedDocs(filteredResults);
+      const finalResults = dedupedResults.slice(
+        0,
+        this.retrievalConfig.finalTopK,
+      );
+
+      if (!finalResults.length) {
+        const noAnswer = '我无法从当前知识库中找到足够的信息';
+
+        appendSessionMessage(currentSessionId, {
+          role: 'user',
+          content: message,
+        });
+
+        appendSessionMessage(currentSessionId, {
+          role: 'assistant',
+          content: noAnswer,
+        });
+
         return {
           success: false,
-          message: '无法从当前知识库中找到答案',
-          source: [],
+          sessionId: currentSessionId,
+          question: message,
+          rewrittenQuestion,
+          answer: noAnswer,
+          citations: [],
+          insufficientEvidence: '知识库中没有足够相关的内容',
+          sources: [],
         };
       }
-      const prompt = this.createPrompt(message, docs);
+
+      const docs = finalResults.map(([doc]) => doc);
+      const prompt = createRagPrompt(rewrittenQuestion, docs);
+
       const res = await this.llm.invoke(prompt);
+      const content =
+        typeof res.content === 'string'
+          ? res.content
+          : JSON.stringify(res.content);
+
+      const parsed = parseRagJsonAnswer(content);
+
+      appendSessionMessage(currentSessionId, {
+        role: 'user',
+        content: message,
+      });
+
+      appendSessionMessage(currentSessionId, {
+        role: 'assistant',
+        content: parsed.answer,
+      });
+
       return {
         success: true,
-        message: res.content,
-        sources: docs.map((doc) => ({
+        sessionId: currentSessionId,
+        question: message,
+        rewrittenQuestion,
+        raw: content,
+        answer: parsed.answer,
+        citations: parsed.citations,
+        insufficientEvidence: parsed.insufficientEvidence,
+        sources: finalResults.map(([doc, score], index) => ({
+          chunkId: `片段${index + 1}`,
+          score,
           content: doc.pageContent,
           metadata: doc.metadata,
         })),
@@ -182,5 +324,50 @@ export class RagService {
         error: e,
       };
     }
+  }
+
+  //获取会话
+  getSession(sessionId: string) {
+    if (!hasSession(sessionId)) {
+      return {
+        success: false,
+        message: '会话不存在',
+        sessionId,
+        history: [],
+      };
+    }
+
+    return {
+      success: true,
+      sessionId,
+      history: getSessionHistory(sessionId),
+    };
+  }
+
+  //清空会话
+  clearSession(sessionId: string) {
+    if (!hasSession(sessionId)) {
+      return {
+        success: false,
+        message: '会话不存在',
+        sessionId,
+      };
+    }
+
+    deleteSession(sessionId);
+
+    return {
+      success: true,
+      message: '会话已清空',
+      sessionId,
+    };
+  }
+
+  //获取会话列表
+  listSessions() {
+    return {
+      success: true,
+      sessions: getAllSessions(),
+    };
   }
 }

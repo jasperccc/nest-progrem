@@ -4,6 +4,9 @@ import {
   Post,
   UploadedFile,
   UseInterceptors,
+  Get,
+  Param,
+  Delete,
 } from '@nestjs/common';
 import { RagService } from './rag.service';
 import { FileInterceptor } from '@nestjs/platform-express';
@@ -22,7 +25,25 @@ export class RagController {
 
   //向量检索提问
   @Post('query')
-  async query(@Body() { message, topK }: { message: string; topK?: number }) {
-    return this.ragService.query(message, topK ?? 3);
+  async query(
+    @Body()
+    { message, sessionId }: { message: string; sessionId?: string },
+  ) {
+    return this.ragService.query(message, sessionId);
+  }
+
+  @Get('session')
+  getSessions() {
+    return this.ragService.listSessions();
+  }
+
+  @Get('session/:sessionId')
+  getSession(@Param('sessionId') sessionId: string) {
+    return this.ragService.getSession(sessionId);
+  }
+
+  @Delete('session/:sessionId')
+  clearSession(@Param('sessionId') sessionId: string) {
+    return this.ragService.clearSession(sessionId);
   }
 }
